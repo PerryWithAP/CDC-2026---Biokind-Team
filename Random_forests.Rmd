@@ -1,0 +1,462 @@
+---
+title: "Random_forests"
+author: "Caroline Fang"
+date: "`r Sys.Date()`"
+output: pdf_document
+...
+
+```{r setup, include=FALSE}
+library(scales)
+library(C50)
+library(xgboost)
+library(quantreg)
+library(rstanarm)
+library(knitr)
+library(tidyverse)
+library(janitor)
+library(funModeling)
+library(skimr)
+library(readr)
+library(lubridate)
+library(DataExplorer)
+library(dlookr)
+library(gt)
+library(corrr)
+library(GGally)
+library(broom)
+library(psych)
+library(sciplot)
+library(gplots)
+library(lsr)
+library(tidymodels)
+library(vip)
+library(yardstick)
+library(forcats)
+library(ranger)
+library(rpart.plot)
+library(mall)
+library(tinytex)
+library(patchwork)
+library(rstanarm) 
+tidymodels_prefer()
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen = 999) 
+```
+
+```{r}
+cdc_data <- read_csv("index_scores_v3_2026.csv", 
+                     show_col_types = FALSE,
+                     na = c("", "NA", "NULL", "N/A", "?", "-")) |>
+  clean_names() 
+```
+
+```{r}
+plot_missing(cdc_data)
+```
+
+```{r}
+numeric_vars <- cdc_data %>%
+  select(where(is.numeric))
+
+par(mfrow = c(1, 3))
+
+for (var in names(numeric_vars)) {
+  boxplot(numeric_vars[[var]],
+          main = var,
+          xlab = "")
+}
+```
+```{r}
+composite_scores = c("economic", "education", "housing", "health", "crime")
+
+ca_df <- cdc_data %>% 
+  filter(state == "CA") %>%
+  group_by(county) %>%
+  summarise(
+    across(
+      all_of(composite_scores),
+      ~ mean(.x, na.rm = TRUE),
+      .names = "avg_{.col}"
+    )
+  )
+```
+
+```{r}
+set.seed(123)
+df_split <- initial_split(ca_df, prop = 0.60, strata = avg_education)
+df_train <- training(df_split)
+df_test  <- testing(df_split)
+
+cat("Training rows:", nrow(df_train), "| Test rows:", nrow(df_test))
+```
+
+
+```{r}
+set.seed(123)
+df_folds <- vfold_cv(df_train, v = 10, strata = avg_education)
+df_folds
+```
+
+```{r}
+shared_rec <- recipe(avg_education ~ ., data = df_train) |>
+  update_role(county, new_role = "ID") %>%
+  step_zv(all_predictors()) |>                     # Remove zero-variance predictors
+  step_impute_median(all_numeric_predictors()) |>   # Impute numeric NAs with median
+  step_impute_mode(all_nominal_predictors()) |>     # Impute factor NAs with mode
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) # One-hot encode factors
+```
+
+```{r}
+reg_metrics <- metric_set(rmse, mae, rsq, mape)
+reg_metrics
+```
+
+```{r}
+rf_spec <- rand_forest(
+  mode  = "regression",
+  trees = tune(),
+  mtry  = tune(),
+  min_n = tune()
+) |>
+  set_engine("ranger",
+             importance = "permutation",
+             seed       = 123)
+
+rf_wf <- workflow() |>
+  add_recipe(shared_rec) |>
+  add_model(rf_spec)
+set.seed(123)
+
+# Count predictors after recipe baking for mtry range
+n_preds <- ncol(bake(prep(shared_rec, df_train), new_data = NULL)) - 1
+
+rf_grid <- grid_latin_hypercube(
+  trees(range = c(700L, 1500L)),
+  mtry(range  = c(1L, 4L)),
+  min_n(range = c(3L, 10L)),
+  size = 25
+)
+
+rf_tune <- tune_grid(
+  rf_wf,
+  resamples = df_folds,
+  grid      = rf_grid,
+  metrics   = reg_metrics,
+  control   = control_grid(save_pred = TRUE)
+)
+
+autoplot(rf_tune)
+```
+
+```{r}
+rf_best      <- select_best(rf_tune, metric = "rmse")
+final_rf_wf  <- finalize_workflow(rf_wf, rf_best)
+final_rf_fit <- fit(final_rf_wf, data = df_train)
+
+rf_best
+```
+
+```{r}
+rf_test_preds <- predict(final_rf_fit, df_test) |>
+  bind_cols(df_test |> select(avg_education))
+
+rf_test_preds |> reg_metrics(truth = avg_education, estimate = .pred)
+```
+
+```{r}
+rf_vi <- vip::vi(extract_fit_engine(final_rf_fit)) |>
+  slice_head(n = 15) |>
+  mutate(
+    pct   = 100 * Importance / sum(Importance),
+    Model = "Random Forest"
+  ) |>
+  rename(Variable = Variable)
+
+ggplot(rf_vi, aes(x = reorder(Variable, pct), y = pct)) +
+  geom_col(fill = "#377EB8") +
+  coord_flip() +
+  scale_x_discrete(labels = c(
+    "avg_economic" = "Economic Composite Score",
+    "avg_health" = "Health Composite Score",
+    "avg_crime" = "Crime Composite Score",
+    "avg_housing" = "Housing Composite Score"
+  )) +
+  labs(
+    title = "Random Forest — Variable Importance",
+    x = NULL,
+    y = "Importance (%)"
+  ) +
+  theme_minimal()
+```
+```{r}
+rf_engine <- extract_fit_engine(final_rf_fit2)
+
+leaf_counts <- sapply(1:rf_engine$num.trees, function(i) {
+  tree <- ranger::treeInfo(rf_engine, tree = i)
+  sum(tree$terminal)
+})
+
+summary(leaf_counts)
+mean(leaf_counts)
+```
+
+
+
+```{r}
+ca_economic_df <- cdc_data %>% 
+  filter(state == "CA") %>%
+  group_by(county) %>%
+  summarise(
+    avg_education = mean(education, na.rm = TRUE),
+    unemployment = mean(unemployment, na.rm = TRUE),
+    poverty = mean(poverty, na.rm = TRUE),
+    access_to_broadband_internet = mean(access_to_broadband_internet, na.rm = TRUE),
+    single_parent_households = mean(single_parent_households, na.rm = TRUE)
+  )
+```
+
+```{r}
+set.seed(123)
+df_split2 <- initial_split(ca_economic_df, prop = 0.60, strata = avg_education)
+df_train2 <- training(df_split2)
+df_test2  <- testing(df_split2)
+
+cat("Training rows:", nrow(df_train2), "| Test rows:", nrow(df_test2))
+```
+
+```{r}
+set.seed(123)
+df_folds2 <- vfold_cv(df_train2, v = 10, strata = avg_education)
+df_folds2
+```
+
+```{r}
+shared_rec2 <- recipe(avg_education ~ ., data = df_train2) |>
+  update_role(county, new_role = "ID") %>%
+  step_zv(all_predictors()) |>                     # Remove zero-variance predictors
+  step_impute_median(all_numeric_predictors()) |>   # Impute numeric NAs with median
+  step_impute_mode(all_nominal_predictors()) |>     # Impute factor NAs with mode
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) # One-hot encode factors
+```
+
+```{r}
+reg_metrics <- metric_set(rmse, mae, rsq, mape)
+```
+
+```{r}
+rf_spec2 <- rand_forest(
+  mode  = "regression",
+  trees = tune(),
+  mtry  = tune(),
+  min_n = tune()
+) |>
+  set_engine("ranger",
+             importance = "permutation",
+             seed       = 123)
+
+rf_wf2 <- workflow() |>
+  add_recipe(shared_rec2) |>
+  add_model(rf_spec2)
+set.seed(123)
+
+# Count predictors after recipe baking for mtry range
+n_preds <- ncol(bake(prep(shared_rec2, df_train2), new_data = NULL)) - 1
+
+rf_grid2 <- grid_latin_hypercube(
+  trees(range = c(300L, 1000L)),
+  mtry(range  = c(1L, 4L)),
+  min_n(range = c(2L, 10L)),
+  size = 25
+)
+
+rf_tune2 <- tune_grid(
+  rf_wf2,
+  resamples = df_folds2,
+  grid      = rf_grid2,
+  metrics   = reg_metrics,
+  control   = control_grid(save_pred = TRUE)
+)
+
+autoplot(rf_tune2)
+```
+
+```{r}
+rf_best2      <- select_best(rf_tune2, metric = "rmse")
+final_rf_wf2  <- finalize_workflow(rf_wf2, rf_best2)
+final_rf_fit2 <- fit(final_rf_wf2, data = df_train2)
+
+rf_best
+```
+
+```{r}
+rf_test_preds2 <- predict(final_rf_fit2, df_test2) |>
+  bind_cols(df_test2 |> select(avg_education))
+
+rf_test_preds2 |> reg_metrics(truth = avg_education, estimate = .pred)
+```
+
+```{r}
+rf_vi2 <- vip::vi(extract_fit_engine(final_rf_fit2)) |>
+  slice_head(n = 15) |>
+  mutate(
+    pct   = 100 * Importance / sum(Importance),
+    Model = "Random Forest"
+  ) |>
+  rename(Variable = Variable)
+
+ggplot(rf_vi2, aes(x = reorder(Variable, pct), y = pct)) +
+  geom_col(fill = "#377EB8") +
+  coord_flip() +
+  scale_x_discrete(labels = c(
+    "access_to_broadband_internet" = "Broadband Internet Access",
+    "single_parent_households" = "Single-Parent Households",
+    "unemployment" = "Unemployment",
+    "poverty" = "Poverty"
+  )) +
+  labs(
+    title = "Random Forest — Variable Importance",
+    x = NULL,
+    y = "Importance (%)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+composite_scores = c("economic", "education", "housing", "health", "crime")
+
+cs_df <- cdc_data %>% 
+  group_by(county) %>%
+  summarise(
+    across(
+      all_of(composite_scores),
+      ~ mean(.x, na.rm = TRUE),
+      .names = "avg_{.col}"
+    ))
+```
+
+```{r}
+set.seed(123)
+df_split3 <- initial_split(cs_df, prop = 0.60, strata = avg_education)
+df_train3 <- training(df_split3)
+df_test3  <- testing(df_split3)
+
+cat("Training rows:", nrow(df_train3), "| Test rows:", nrow(df_test3))
+```
+
+
+```{r}
+set.seed(123)
+df_folds3 <- vfold_cv(df_train3, v = 10, strata = avg_education)
+df_folds3
+```
+
+```{r}
+shared_rec3 <- recipe(avg_education ~ ., data = df_train3) |>
+  update_role(county, new_role = "ID") %>%
+  step_zv(all_predictors()) |>                     # Remove zero-variance predictors
+  step_impute_median(all_numeric_predictors()) |>   # Impute numeric NAs with median
+  step_impute_mode(all_nominal_predictors()) |>     # Impute factor NAs with mode
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) # One-hot encode factors
+```
+
+```{r}
+reg_metrics <- metric_set(rmse, mae, rsq, mape)
+reg_metrics
+```
+
+```{r}
+rf_spec3 <- rand_forest(
+  mode  = "regression",
+  trees = tune(),
+  mtry  = tune(),
+  min_n = tune()
+) |>
+  set_engine("ranger",
+             importance = "permutation",
+             seed       = 123)
+
+rf_wf3 <- workflow() |>
+  add_recipe(shared_rec3) |>
+  add_model(rf_spec3)
+set.seed(123)
+
+# Count predictors after recipe baking for mtry range
+n_preds <- ncol(bake(prep(shared_rec3, df_train3), new_data = NULL)) - 1
+
+rf_grid3 <- grid_latin_hypercube(
+  trees(range = c(700L, 1500L)),
+  mtry(range  = c(1L, 4L)),
+  min_n(range = c(3L, 10L)),
+  size = 25
+)
+
+rf_tune3 <- tune_grid(
+  rf_wf3,
+  resamples = df_folds3,
+  grid      = rf_grid3,
+  metrics   = reg_metrics,
+  control   = control_grid(save_pred = TRUE)
+)
+
+autoplot(rf_tune3)
+```
+
+```{r}
+rf_best3      <- select_best(rf_tune3, metric = "rmse")
+final_rf_wf3  <- finalize_workflow(rf_wf3, rf_best3)
+final_rf_fit3 <- fit(final_rf_wf3, data = df_train3)
+
+rf_best
+```
+
+```{r}
+rf_test_preds3 <- predict(final_rf_fit3, df_test3) |>
+  bind_cols(df_test3 |> select(avg_education))
+
+rf_test_preds3 |> reg_metrics(truth = avg_education, estimate = .pred)
+```
+
+```{r}
+rf_vi3 <- vip::vi(extract_fit_engine(final_rf_fit3)) |>
+  slice_head(n = 15) |>
+  mutate(
+    pct   = 100 * Importance / sum(Importance),
+    Model = "Random Forest"
+  ) |>
+  rename(Variable = Variable)
+
+ggplot(rf_vi3, aes(x = reorder(Variable, pct), y = pct)) +
+  geom_col(fill = "#377EB8") +
+  coord_flip() +
+  scale_x_discrete(labels = c(
+    "avg_economic" = "Economic Composite Score",
+    "avg_health" = "Health Composite Score",
+    "avg_crime" = "Crime Composite Score",
+    "avg_housing" = "Housing Composite Score"
+  )) +
+  labs(
+    title = "Random Forest — Variable Importance",
+    x = NULL,
+    y = "Importance (%)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+highschool_df <- cdc_data %>%
+  group_by(state) %>%
+  filter(state != "PR") %>%
+  summarise(avg_less_than_hs = mean(less_than_hs, na.rm = TRUE)) %>%
+  slice_max(order_by = avg_less_than_hs,n=10) 
+
+ggplot(highschool_df,aes(x = state, y = avg_less_than_hs)) +
+  geom_col(fill = "#377EB8") +
+  labs(
+    title = "Highest Average Percentage of Population with Less Than High School Education",
+    x = "State",
+    y = "Average Percentage Less Than High School (%)"
+  ) +
+  theme_minimal()
+  
+```
+
