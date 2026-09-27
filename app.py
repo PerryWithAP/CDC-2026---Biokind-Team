@@ -13,8 +13,8 @@ DF = pd.read_csv(r"C:\Users\pdawg\OneDrive\CDC 2026 DATA\doi-10.7281-t170wn53\in
 app = Dash(__name__)
 
 app.layout = html.Div([
-    html.H4('Political candidate voting pool analysis'),
-    html.P("Select a candidate:"),
+    html.H4('Burden In California By Type Of Burden'),
+    html.P("Select a Burden:"),
     dcc.RadioItems(
         id='candidate',
         options=["Economic", "Education","Health", "Housing", "Crime"],
