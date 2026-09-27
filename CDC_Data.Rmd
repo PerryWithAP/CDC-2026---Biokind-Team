@@ -1,0 +1,69 @@
+---
+title: "CDC_Data"
+author: "Caroline Fang"
+date: "`r Sys.Date()`"
+output: pdf_document
+...
+
+```{r setup, include=FALSE}
+library(scales)
+library(C50)
+library(xgboost)
+library(quantreg)
+library(rstanarm)
+library(knitr)
+library(tidyverse)
+library(janitor)
+library(funModeling)
+library(skimr)
+library(readr)
+library(lubridate)
+library(DataExplorer)
+library(dlookr)
+library(gt)
+library(corrr)
+library(GGally)
+library(broom)
+library(psych)
+library(sciplot)
+library(gplots)
+library(lsr)
+library(tidymodels)
+library(vip)
+library(yardstick)
+library(forcats)
+library(ranger)
+library(rpart.plot)
+library(mall)
+library(tinytex)
+library(patchwork)
+library(rstanarm) 
+tidymodels_prefer()
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen = 999) 
+```
+
+```{r}
+cdc_data <- read_csv("index_scores_v3_2026.csv", 
+                     show_col_types = FALSE,
+                     na = c("", "NA", "NULL", "N/A", "?", "-")) |>
+  clean_names() 
+```
+
+```{r}
+plot_missing(cdc_data)
+```
+
+```{r}
+numeric_vars <- cdc_data %>%
+  select(where(is.numeric))
+
+par(mfrow = c(1, 3))
+
+for (var in names(numeric_vars)) {
+  boxplot(numeric_vars[[var]],
+          main = var,
+          xlab = "")
+}
+```
+
